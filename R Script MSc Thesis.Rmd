@@ -1,0 +1,637 @@
+---
+title: "MSC SCM Thesis Tim Alkemade"
+output: html_notebook
+---
+
+
+#CONTENTS
+
+A. Data Import and Cleaning
+B. Initial data Exploration
+C. Create (in)dependent variables
+D. Random sampling
+E. Create dependent variable
+F. Data exploration ((in)dependent variables)
+G. Parametric survival analysis
+
+
+
+
+#Load packages
+
+```{r}
+library(readxl)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(tibble)
+library(chron)
+library(anytime)
+library(ggplot2)
+library(pastecs)
+library(survival)
+library(survminer)
+library(gtsummary)
+```
+
+##A. Data Import and cleansing ##
+
+```{r}
+#clear environment
+#remove(list=ls()) 
+
+#Set working directory
+#dir      <- "C:/Users/timbr/Documents/MSc Thesis SCM/"
+
+#Load dataset
+#Customer_Reservation_Data_Feb2016_Mar2020_raw <- read_excel("MSc Thesis SCM/R/Data/Customer Reservation Data Feb2016-Mar2020 raw.csv")
+
+#Rename dataset
+RestaurantData = Customer_Reservation_Data_Feb2016_Mar2020_raw
+#rm(Customer_Reservation_Data_Feb2016_Mar2020_raw)
+
+#Remove transactions which did not actually take place (number of visits = 0 or status = "Rejected")
+RestaurantData = subset(RestaurantData, RestaurantData$`number of visits` != 0)
+RestaurantData = subset(RestaurantData, RestaurantData$status != "Rejected")
+
+```
+
+#Add a transaction ID column
+
+```{r}
+#Add transaction ID
+RestaurantData$TransactionID <- seq.int(nrow(RestaurantData))
+
+#set transaction ID column as first column
+RestaurantData <- RestaurantData %>%
+  select(TransactionID, everything())
+```
+
+#create timestamp column
+
+```{r}
+#subtract clock time of arrival
+RestaurantData$clocktime = substr(RestaurantData$`Arrived Time`, 21,nchar(RestaurantData$`Arrived Time`))
+
+#convert to european time
+RestaurantData$clocktime = format(as.POSIXct(RestaurantData$clocktime,format='%I:%M %p'),format="%H:%M")
+
+#ggplot of arrival distribution
+ggplot(RestaurantData, aes(x = `clocktime`)) +
+  geom_bar() + 
+  ggtitle("Distribution arrival times") +
+  labs(x="Arrival times", y="Count") +
+   scale_x_discrete(breaks = 60)
+
+#Remove transactions with arrival between 1:00-11:30 and 16:00-18:30 from dataset (these are closing times)
+RestaurantData = subset(RestaurantData, clocktime < c("01:01") | clocktime > c("11:29") & clocktime < c("16:31") | clocktime > c("18:29"))
+
+```
+
+#create Date column
+
+```{r}
+#subtract dates 
+RestaurantData$Date = substr(RestaurantData$`Arrived Time`, 1, 14) 
+
+#formatting
+RestaurantData$Date = gsub(",","",RestaurantData$Date) 
+RestaurantData$Date = gsub("st","",RestaurantData$Date)
+RestaurantData$Date = gsub("nd","",RestaurantData$Date)
+RestaurantData$Date = gsub("rd","",RestaurantData$Date)
+RestaurantData$Date = gsub("th","",RestaurantData$Date)
+
+#convert to class date
+RestaurantData$Date = as.Date(RestaurantData$Date, format="%d %b %Y")
+```
+
+
+
+##B. Initial data Exploration ##
+
+
+#ggplots
+
+```{r}
+ggplot(RestaurantData, aes(x = `number of visits`)) +
+  geom_bar() + 
+  ggtitle("Distribution Number of visits") +
+  scale_x_continuous(limits = c(0, 10), breaks = 0:10)  +
+  labs(x="Number of visits", y="Count")
+
+
+ggplot(RestaurantData, aes(x = `group size`)) +
+  geom_histogram() + 
+  ggtitle("Distribution Group Size") +
+  scale_x_continuous(limits = c(1, 10), breaks = 1:10) +
+  labs(x="Group Size", y="Count")
+
+ggplot(RestaurantData, aes(x = `Type of transaction`)) +
+  geom_bar() + 
+  ggtitle("Distribution Transaction Type") +
+  scale_y_continuous(limits = c(0, 300000), breaks = seq(0,300000, 50000)) +
+  labs(x="Type of transaction", y="Count")
+
+ggplot(RestaurantData, aes(x = status)) +
+  geom_bar() + 
+  ggtitle("Distribution Status") +
+  scale_y_continuous(limits = c(0, 200000), breaks = seq(0,200000, 50000)) +
+  labs(x="Status", y="Count")
+
+```
+
+
+#Revenue development over customer lifetime
+
+
+```{r}
+#determine the visit number of a particular visit by a customer
+RestaurantData <- RestaurantData %>%
+  group_by(`Customer ID`) %>%
+  mutate(visit_number = row_number(`Customer ID`))
+
+#select rows with available spend data
+spend_data = RestaurantData[complete.cases(RestaurantData$`spend data`),] 
+
+#Calculate average revenue per visit_number
+spend_data = aggregate(list(average_spend = as.numeric(spend_data$`spend data`)), by = list(visit_number = spend_data$visit_number), FUN = mean)
+
+#omit revenues of 0
+spend_data = subset(spend_data, average_spend > 0)
+
+
+
+#histogram
+
+ggplot(spend_data, aes(x=visit_number, y = average_spend)) +
+  geom_smooth() +
+  labs(x="Visit number", y="Average spend (INR)") #the spend per visit fluctuates around 3000 rupies
+
+
+```
+
+
+
+
+#main statistics
+
+```{r}
+#number of unique customer ID's
+length(unique(RestaurantData$`Customer ID`)) #135,939 unique customers
+
+#mean and standard deviation of total number of visits per customer ID (at any given moment)
+rbind(mean(na.omit(RestaurantData$`number of visits`)),sd(na.omit(RestaurantData$`number of visits`))) #mean = 1.75, sd = 2.63
+
+```
+
+
+##C. Create (in)dependent variables ##
+
+
+
+#1. Add number of past visits, reservations, cancellations and No Shows (the drivers of retention/main independent variables)
+
+```{r}
+
+#run a for loop for every independent variable. For every observation, the date of the summed observations should be within 365 days before the observed date, customer Id should correspond and the status depends on the variable being measured. 
+
+
+#number of past visits
+
+for (i in 1:nrow(RestaurantData)) {
+ RestaurantData$num_past_visits[i] = nrow(subset(RestaurantData, RestaurantData$Date < RestaurantData$Date[i] & RestaurantData$Date > RestaurantData$Date[i] - 365 & RestaurantData$`Customer ID` == RestaurantData$`Customer ID`[i] & RestaurantData$status == "Seated")) 
+}
+
+
+#number of past cancellations
+
+for (i in 1:nrow(RestaurantData)) {
+ RestaurantData$num_cancellations_ratio[i] = nrow(subset(RestaurantData, RestaurantData$Date < RestaurantData$Date[i] & RestaurantData$Date > RestaurantData$Date[i] - 365 & RestaurantData$`Customer ID` == RestaurantData$`Customer ID`[i] & RestaurantData$status == "User Cancelled"))
+}
+
+
+#number of cancellations relative to past visits
+
+#for (i in 1:nrow(Sample)) {
+#Sample$num_cancellations_ratio[i] = as.numeric(nrow(subset(Sample, Sample$Date < Sample$Date[i] & Sample$Date > Sample$Date[i] - 365 & Sample$`Customer ID` == Sample$`Customer ID`[i] &Sample$status == "User Cancelled")))/as.numeric(Sample$num_past_visits)
+#}
+
+Sample = Sample %>% mutate(num_cancellations_ratio = ifelse(num_past_visits > 0 & num_cancellations > 0, num_cancellations/num_past_visits, NA))
+
+
+#number of past Walk-Ins
+
+for (i in 1:nrow(RestaurantData)) {
+ RestaurantData$num_walk_ins[i] = nrow(subset(RestaurantData, RestaurantData$Date < RestaurantData$Date[i] & RestaurantData$Date > RestaurantData$Date[i] - 365 & RestaurantData$`Customer ID` == RestaurantData$`Customer ID`[i] & RestaurantData$`Type of transaction` == "Walkin"))
+} 
+
+#define frequency of visiting
+
+start_date =  min(na.omit(RestaurantData$Date)) #define start date
+
+RestaurantData = RestaurantData %>% mutate(frequency = (as.numeric(Date - start_date)/num_past_visits))
+RestaurantData = RestaurantData %>% mutate(frequency = ifelse(frequency == 'Inf', 0, frequency)) #change formatting
+
+
+#define number of days since last visit
+
+RestaurantData = RestaurantData %>% group_by(`Customer ID`) %>% mutate(days_since_last_visit = Date - lag(Date))
+
+RestaurantData$days_since_last_visit = as.numeric(RestaurantData$days_since_last_visit, units="days")
+
+RestaurantData = RestaurantData %>% mutate(days_since_last_visit = ifelse(days_since_last_visit == 0,NA, days_since_last_visit)) #remove values for first time visits, as they are not meaningful
+
+RestaurantData$days_since_last_visit = as.numeric(RestaurantData$days_since_last_visit) #set class to numeric
+
+
+#RestaurantData = RestaurantData %>% mutate(days_since_last_visit = max(0,days_since_last_visit-7))
+
+
+#remove observations during the first year (we start counting from one year after the first observation) 
+
+
+RestaurantData = subset(RestaurantData, Date > start_date + 365)
+
+```
+
+
+#2. Add a timeslot column (one of the control variables)
+
+```{r}
+
+#convert timestamps to timeslots
+RestaurantData <- RestaurantData %>% 
+  mutate(Slot = if_else(clocktime > c("11:29:00") & clocktime < c("20:01"), if_else(clocktime < c("16:01"),if_else(clocktime < c("14:01"),1,2),3),4))
+
+
+#note that the control variable 'group size' was already calculated
+```
+
+
+
+
+
+## D. Create Dependent variable and Event Status##
+
+
+#Create Dependent variable
+
+```{r}
+
+#define number of days till next visit
+
+RestaurantData = RestaurantData %>% group_by(`Customer ID`) %>% mutate(days_till_next_visit = lead(Date) - Date)
+
+
+#In the days_till_next_visit column, NA-values indicate that the customer will not return before the end of the dataset -> Change all NA's to the number of days until the end date of the observation period
+
+end_date = max(na.omit(RestaurantData$Date)) #define end date (29 February 2020)
+  
+RestaurantData = RestaurantData %>% mutate(days_till_next_visit = ifelse(!is.na(Date) & is.na(days_till_next_visit), end_date - Date, days_till_next_visit))
+```
+
+
+
+#Create Event Status (required input for Cox survival model)
+
+```{r}
+#If the number of days until revisiting is non-available, indicate that the customer does not come back (status = 1). Otherwise, customer comes back (status = 0)
+
+RestaurantData = RestaurantData  %>% mutate(Status = if_else(is.na(days_till_next_visit), 1, 0))
+```
+
+
+
+
+## E. Random sampling of observations (1 per customer ID) ##
+
+```{r}
+#Select random sample of actual visits (only considering customers who were actually seated at least once)
+
+set.seed(101)
+
+Sample = subset(RestaurantData, status = "Seated") %>%
+  group_by(`Customer ID`) %>%
+  sample_n(1)
+
+```
+
+
+
+## F. Data exploration
+
+#Bar plots of (in)dependent variables
+
+```{r}
+#number of past visits
+ggplot(Sample, aes(x = num_past_visits)) +
+  geom_bar() +
+  ggtitle("Distribution Number of past visits") +
+  labs(x="Number of past visits", y="Count") 
+
+#number of past cancellations
+ggplot(Sample, aes(x = num_cancellations)) +
+  geom_bar() +
+  ggtitle("Distribution Number of past Cancellations") +
+  labs(x="Number of past cancellations", y="Count")
+
+#number of past No Shows
+#ggplot(Sample, aes(x = num_no_shows)) +
+  #geom_bar() +
+  #ggtitle("Distribution Number of past No Shows") +
+  #scale_x_continuous(limits = c(0, 4))  +
+  #scale_y_continuous(limits = c(0, 120), breaks = seq(0,120, 20)) + 
+  #labs(x="Number of past No Shows", y="Count") #apparently, none of the customers has not shown up before
+
+
+#Arrival slots
+
+ggplot(Sample, aes(x = Slot)) +
+  geom_bar() +
+  ggtitle("Distribution of Arrival Time slots") +
+  scale_x_continuous(limits = c(0, 5))  +
+  scale_y_continuous(limits = c(0, 25000), breaks = seq(0,25000, 2500)) + 
+  labs(x="Arrival slots", y="Count") 
+
+#Days since last visit
+
+ggplot(Sample, aes(x = days_since_last_visit)) +
+  geom_bar() +
+  ggtitle("Distribution of Days since last visit") +
+  scale_x_continuous(limits = c(0, 1200))  +
+  scale_y_continuous(limits = c(0, 50), breaks = seq(0,50, 5)) + 
+  labs(x="Days since last visit", y="Count") #data is skewed to the left
+
+#square root of number of Days since last visit
+
+ggplot(Sample, aes(x = sqrt(days_since_last_visit))) +
+  geom_bar() +
+  ggtitle("Distribution square root of Days since last visit") +
+  
+  scale_y_continuous(limits = c(0, 50), breaks = seq(0,50, 5)) + 
+  labs(x="sqrt(Days since last visit)", y="Count") #data is skewed to the left
+
+#Group size
+
+groupsize = barplot(Sample$`group size`,
+main = "Distribution of group sizes",
+xlab = "Group size",
+ylab = "Count",
+col = "darkgrey")
+
+
+#Time until customer returns (dependent variable)
+
+ggplot(Sample, aes(x = days_till_next_visit)) +
+  geom_bar() +
+  ggtitle("Distribution of Days till next visit") +
+  scale_x_continuous(limits = c(0, 1200))  +
+  scale_y_continuous(limits = c(0, 200), breaks = seq(0,200, 20)) + 
+  labs(x="Days till next visit", y="Count") 
+
+
+```
+
+
+#Shapiro Test for normality: days since last visit
+
+```{r}
+
+rsample = as.numeric(unlist(sample_n(data.frame(Sample$days_since_last_visit),5000))) #take 5000 random values from the sample, as Shapiro-Wilkins allows a maximum of 5000 values.
+
+shapiro.test(rsample)
+```
+
+
+
+## G. Survival Model ##
+
+
+#1. Kaplan-Meier method
+
+
+#Estimating survival curves with the Kaplan-Meier method
+
+```{r}
+f1 <- survfit(Surv(days_till_next_visit, Status, type=c('right')) ~ 1, data = Sample) #indicate that data is right-censored
+f1 #the median surival time is 571 days
+``` 
+
+
+#Kaplan-Meier plot
+
+```{r}
+ggsurvplot(
+    fit = f1, data = Sample, 
+    xlab = "Days", 
+    ylab = "Overall retention probability") #the plot shows a stepfunction, where each 'step' down indicates a lower chance of returning for a longer time period
+```
+
+
+#Estimating x-year survival
+
+```{r}
+summary(f1, times = 365.25) #1-year survival probability: 0.70
+summary(f1, times = 730.25) #2-year survival probability: 0.38
+summary(f1, times = 1095.25) #3-year survival probability: 0.04
+```
+
+
+#Comparing survival times between groups
+
+```{r}
+f1.a <- survdiff(Surv(days_till_next_visit, Status, type=c('right')) ~ Slot, data = Sample)
+f1.b <- survdiff(Surv(days_till_next_visit, Status, type=c('right')) ~ Sample$`group size`, data = Sample)
+
+f1.a #show test-statistic between Slots (Chi-squared)
+f1.b #show test-statistic between group sizes (Chi-squared)
+
+1 - pchisq(f1.a$chisq, length(f1.a$n) - 1) #calculate p-value
+1 - pchisq(f1.b$chisq, length(f1.b$n) - 1) #calculate p-value
+```
+
+
+
+
+#2. Cox survival model
+
+
+#Fit the Cox survival model
+
+```{r}
+#Cox model with 'days_till_next_visit' as the survival time, 'Status' as the event and the data specified to be right-censored
+
+f2 = coxph(Surv(days_till_next_visit, Status, type=c('right')) ~ num_cancellations_ratio + as.integer(sqrt(days_since_last_visit)) + num_past_visits + Slot + `group size`, data = Sample) #version with square root-transformed days_since_last_visit
+
+```
+
+
+
+#testing for the proportional hazards assumption
+
+```{r}
+test.ph <- cox.zph(f2)
+test.ph
+```
+
+
+#testing for influential observations
+
+```{r}
+ggcoxdiagnostics = ggcoxdiagnostics(f2, type = "deviance",
+                 linear.predictions = FALSE, ggtheme = theme_bw())
+ggcoxdiagnostics$data
+```
+
+
+#testing for non-linearity
+
+```{r}
+ggcoxfunctional(Surv(days_till_next_visit, Status, type=c('right')) ~ num_cancellations + sqrt(num_cancellations), data = Sample)
+
+
+ggcoxfunctional(Surv(days_till_next_visit, Status, type=c('right')) ~ num_past_visits  + sqrt(num_past_visits)  , data = Sample)
+
+ggcoxfunctional(Surv(days_till_next_visit, Status, type=c('right')) ~ Slot + log(Slot ) + sqrt(Slot ) , data = Sample)
+
+ggcoxfunctional(Surv(days_till_next_visit, Status, type=c('right')) ~ `group size`+ log(`group size`) + sqrt(`group size`), data = Sample)
+
+
+```
+
+
+#create residuals data.frame
+
+```{r}
+residuals = data.frame(f2$residuals)
+residuals$rownames = rownames(residuals) #assign rowname column to residuals data
+residuals = data.frame(residuals[residuals$f2.residuals < -2 | residuals$f2.residuals > 2, ]) #select outliers with inaccurate predictions
+
+Sample$rownames = rownames(Sample) #assign rowname column to sample data
+
+residuals = merge(Sample, residuals, by = "rownames") #merge sample data with residuals
+```
+
+
+#comparing outliers to other observations
+
+
+```{r}
+mean(residuals$`group size`)
+mean(Sample$`group size`)
+
+mean(residuals$`number of visits`)
+mean(Sample$`number of visits`)
+
+mean(residuals$num_cancellations)
+mean(Sample$num_cancellations)
+
+mean(residuals$days_since_last_visit)
+mean(Sample$days_since_last_visit)
+
+mean(residuals$days_till_next_visit)
+mean(Sample$days_till_next_visit)
+```
+
+
+
+#Formatting Cox regression results
+
+```{r}
+f2 %>% gtsummary::tbl_regression(exp = TRUE)  
+```
+
+
+
+#Model evaluation: Concordance Index
+
+```{r}
+ggforest(f2, data = Sample) #concordance index = 0.61
+```
+
+
+
+#H. Customer risk profiles
+
+```{r}
+#comparison across regular customers and first-time visitors
+
+a.1 = mean(Sample$days_till_next_visit[Sample$num_past_visits >= 1 & Sample$Status == 0]) #mean: days
+a.2 = mean(Sample$days_till_next_visit[Sample$num_past_visits == 0 & Sample$Status == 0]) #mean: days 
+
+barplot(c(a.1,a.2), width = 0.5, names.arg=c("Regulars", "First-timers"), ylab = "Days until next visit", ylim = c(0,250))
+  
+
+#comparison across cancelers and non-cancelers
+
+b.1 = mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$Status == 0]) #mean: days
+b.2 = mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$Status == 0]) #mean: days 
+
+barplot(c(b.1,b.2), names.arg=c("Non-cancelers", "Cancelers"), ylab = "Days until next visit", ylim = c(0,250), width = 1)
+
+
+#comparison across recent and non-recent visitors
+
+c.1 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit < 30 & Sample$Status == 0]) #mean: days 
+c.2 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit > 29 & Sample$Status == 0]) #mean: days
+
+barplot(c(c.1,c.2), names.arg=c("Recent visitors", "Non-recent visitors"), ylab = "Days until next visit", ylim = c(0,250), width = 1)
+
+#comparison across risk profiles
+
+mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$num_past_visits >= 1 & Sample$days_since_last_visit < 30]) #mean: days
+
+mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$num_past_visits == 0 & Sample$days_since_last_visit > 29]) #mean: days
+```
+
+
+
+
+#I. Expected revenue (in the next year)
+
+```{r}
+
+Sample$res_CLV = 365/Sample$days_till_next_visit #calculate expected number of future visits
+Sample = Sample %>% mutate(res_CLV = ifelse(res_CLV == 'Inf', 0, res_CLV)) #reformat
+Sample = Sample %>% mutate(res_CLV = ifelse(res_CLV == 'NaN', 0, res_CLV)) #reformat
+Sample$res_CLV = Sample$res_CLV*3000 #calculate monetary CLV per customer
+
+Sample = Sample %>% mutate(days_since_last_visit = ifelse(is.na(days_since_last_visit), Inf, days_since_last_visit)) #reformat
+
+mean(Sample$res_CLV) #Revenue for average customers = ₹10,346 
+
+
+#comparison across regular customers and first-time visitors
+
+mean(Sample$res_CLV[Sample$num_past_visits >= 1]) #Revenue regular visitors = ₹ 
+
+mean(Sample$res_CLV[Sample$num_past_visits == 0]) #Revenue for first-time visitors = ₹
+
+
+#comparison across cancelers and non-cancelers
+
+mean(Sample$res_CLV[Sample$num_cancellations <= 2]) #Revenue for cancelers = ₹ 
+
+mean(Sample$res_CLV[Sample$num_cancellations >= 3]) #Revenue for non-cancelers = ₹ 
+
+
+#comparison across recent and non-recent visitors
+
+mean(Sample$res_CLV[Sample$days_since_last_visit < 30]) #Revenue for recent visitors = ₹21,258.46 
+
+mean(Sample$res_CLV[Sample$days_since_last_visit > 29]) #Revenue for non-recent visitors = ₹9,812.08 
+
+
+
+#comparison across risk profiles
+
+mean(Sample$res_CLV[Sample$num_cancellations <= 2 & Sample$num_past_visits >= 1 & Sample$days_since_last_visit < 30]) #Revenue for low-risk profiles = ₹21,258.46 
+
+mean(Sample$res_CLV[Sample$num_cancellations >= 3 & Sample$num_past_visits == 0 & Sample$days_since_last_visit > 29]) #Revenue for high-risk profiles = ₹9,812.08 
+```
+
+f2$residuals
+
+
+
