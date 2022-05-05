@@ -33,6 +33,7 @@ library(pastecs)
 library(survival)
 library(survminer)
 library(gtsummary)
+library(stargazer)
 ```
 
 ##A. Data Import and cleansing ##
@@ -240,7 +241,7 @@ RestaurantData = RestaurantData %>% group_by(`Customer ID`) %>% mutate(days_sinc
 
 RestaurantData$days_since_last_visit = as.numeric(RestaurantData$days_since_last_visit, units="days")
 
-RestaurantData = RestaurantData %>% mutate(days_since_last_visit = ifelse(days_since_last_visit == 0,NA, days_since_last_visit)) #remove values for first time visits, as they are not meaningful
+Sample = Sample %>% mutate(Sample$days_since_last_visit = ifelse(Sample$days_since_last_visit == Inf, , Sample$days_since_last_visit)) #remove values for first time visits, as they are not meaningful
 
 RestaurantData$days_since_last_visit = as.numeric(RestaurantData$days_since_last_visit) #set class to numeric
 
@@ -557,32 +558,32 @@ ggforest(f2, data = Sample) #concordance index = 0.61
 ```{r}
 #comparison across regular customers and first-time visitors
 
-a.1 = mean(Sample$days_till_next_visit[Sample$num_past_visits >= 1 & Sample$Status == 0]) #mean: days
-a.2 = mean(Sample$days_till_next_visit[Sample$num_past_visits == 0 & Sample$Status == 0]) #mean: days 
+a.1 = mean(Sample$days_till_next_visit[Sample$num_past_visits >= 1 & Sample$Status == 0]) #mean: 
+a.2 = mean(Sample$days_till_next_visit[Sample$num_past_visits == 0 & Sample$Status == 0]) #mean: 
 
 barplot(c(a.1,a.2), width = 0.5, names.arg=c("Regulars", "First-timers"), ylab = "Days until next visit", ylim = c(0,250))
   
 
 #comparison across cancelers and non-cancelers
 
-b.1 = mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$Status == 0]) #mean: days
-b.2 = mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$Status == 0]) #mean: days 
+b.1 = mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$Status == 0]) #mean: 
+b.2 = mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$Status == 0]) #mean: 
 
 barplot(c(b.1,b.2), names.arg=c("Non-cancelers", "Cancelers"), ylab = "Days until next visit", ylim = c(0,250), width = 1)
 
 
 #comparison across recent and non-recent visitors
 
-c.1 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit < 30 & Sample$Status == 0]) #mean: days 
-c.2 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit > 29 & Sample$Status == 0]) #mean: days
+c.1 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit < 30 & Sample$Status == 0]) #mean:  
+c.2 = mean(Sample$days_till_next_visit[Sample$days_since_last_visit > 29 & Sample$Status == 0]) #mean: 
 
 barplot(c(c.1,c.2), names.arg=c("Recent visitors", "Non-recent visitors"), ylab = "Days until next visit", ylim = c(0,250), width = 1)
 
 #comparison across risk profiles
 
-mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$num_past_visits >= 1 & Sample$days_since_last_visit < 30]) #mean: days
+mean(Sample$days_till_next_visit[Sample$num_cancellations == 0 & Sample$num_past_visits >= 1 & Sample$days_since_last_visit < 30]) #mean: 
 
-mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$num_past_visits == 0 & Sample$days_since_last_visit > 29]) #mean: days
+mean(Sample$days_till_next_visit[Sample$num_cancellations >= 1 & Sample$num_past_visits == 0 & Sample$days_since_last_visit > 29]) #mean: 
 ```
 
 
@@ -633,5 +634,36 @@ mean(Sample$res_CLV[Sample$num_cancellations >= 3 & Sample$num_past_visits == 0 
 
 f2$residuals
 
+
+
+#Risk scores
+
+```{r}
+Sample$risk_score = Sample$num_cancellations*2.83 + as.numeric(Sample$days_since_last_visit)*1.05 - Sample$num_past_visits*0.18 
+```
+
+
+#Fitting linear model on first half of the sample
+
+```{r}
+lm = lm(days_till_next_visit ~ risk_score, data = Sample[1:40706,])
+stargazer(lm, type = 'text')
+```
+
+
+#Validating linear model on second half of the sample
+
+```{r}
+Sample$pred_days_till_next_visit = Sample$risk_score * 0.185 
+
+```
+
+
+#Evaluating Performance
+
+```{r}
+Sample$error_margin = Sample$pred_days_till_next_visit/Sample$days_till_next_visit #calculate margins of error
+mean(Sample$error_margin) #average error margin = 13.7%
+```
 
 
